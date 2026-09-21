@@ -1,0 +1,53 @@
+# Environment files, local configuration, and credentials
+.env*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Virtual environments and Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local databases and database sidecars
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Logs, temporary files, and local-only reports
+*.log
+*.tmp
+*.temp
+tmp/
+temp/
+audit/
+audits/
+review/
+reviews/
+reports/
+private/
+*_audit.*
+*_review.*
+*_report.*
+
+# Local agent/workspace metadata
+.agents/
+.codex/
+
+# Build artifacts and editor metadata
+build/
+dist/
+*.egg-info/
+.DS_Store
+.idea/
+.vscode/

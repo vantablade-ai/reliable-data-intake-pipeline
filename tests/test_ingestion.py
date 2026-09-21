@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+from app.services.normalization import normalize_candidate
+from app.adapters.base import ProviderCandidate
+
+
+def alpha_record(**overrides):
+    record = {
+        "record_id": "alpha-1",
+        "email": "person@example.test",
+        "first_name": "Person",
+        "last_name": "Example",
+        "company": "Example Labs",
+    }
+    record.update(overrides)
+    return record
+
+
+def test_valid_provider_alpha_record(client):
+    response = client.post("/ingest/provider_alpha", json=alpha_record())
+    assert response.status_code == 201
+    body = response.json()
+    assert body["accepted_count"] == 1
+    assert body["status"] == "succeeded"
+    records = client.get("/records").json()
+    assert len(records) == 1
+    assert records[0]["email"] == "person@example.test"
+
+
+def test_valid_provider_beta_record(client):
+    response = client.post("/ingest/provider_beta", json={
+        "contactId": "beta-1",
+        "contactEmail": "BETA@EXAMPLE.TEST",
+        "fullName": "Beta Person",
+        "organization": {"name": "Example Labs"},
+    })
+    assert response.status_code == 201
+    assert response.json()["accepted_count"] == 1
+
+
+def test_provider_gamma_variation_routes_missing_email_to_review(client):
+    response = client.post("/ingest/provider_gamma", json={
+        "ref": "gamma-1",
+        "mail": "",
+        "name": "Morgan Lee",
+        "org": "Orbit Works",
+        "metadata": {"unrelated": True},
+    })
+    assert response.status_code == 201
+    body = response.json()
+    assert body["review_count"] == 1
+    assert body["items"][0]["reasons"] == ["missing_email"]
+    assert len(client.get("/reviews").json()) == 1
+
+
+def test_malformed_record_is_rejected(client):
+    response = client.post("/ingest/provider_alpha", json=alpha_record(email="not-an-email"))
+    assert response.status_code == 201
+    body = response.json()
+    assert body["rejected_count"] == 1
+    assert body["items"][0]["decision"] == "REJECTED"
+    assert client.get("/records").json() == []
+
+
+def test_missing_required_source_id_is_rejected(client):
+    response = client.post("/ingest/provider_alpha", json=alpha_record(record_id=None))
+    assert response.status_code == 201
+    assert "missing_source_record_id" in response.json()["items"][0]["reasons"]
+
+
+def test_normalization_is_deterministic():
+    candidate = normalize_candidate(ProviderCandidate(
+        source_record_id=" x ", email="  PERSON@Example.Test ", first_name="  Pat ", last_name=" Doe ", company_name=" Example  Labs ",
+    ))
+    assert candidate.source_record_id == "x"
+    assert candidate.email == "person@example.test"
+    assert candidate.first_name == "Pat"
+    assert candidate.company_name == "Example Labs"
+    assert candidate.validation_reasons == []
+
+
+def test_exact_repeat_does_not_create_duplicate_canonical_record(client):
+    first = client.post("/ingest/provider_alpha", json=alpha_record())
+    second = client.post("/ingest/provider_alpha", json=alpha_record())
+    assert first.json()["accepted_count"] == 1
+    assert second.json()["duplicate_count"] == 1
+    assert second.json()["items"][0]["reasons"] == ["same_source_record"]
+    assert len(client.get("/records").json()) == 1
+
+
+def test_cross_provider_duplicate_uses_normalized_email(client):
+    client.post("/ingest/provider_alpha", json=alpha_record())
+    response = client.post("/ingest/provider_beta", json={
+        "contactId": "beta-duplicate",
+        "contactEmail": "PERSON@EXAMPLE.TEST",
+        "fullName": "Person Example",
+        "organization": {"name": "Example Labs"},
+    })
+    assert response.json()["duplicate_count"] == 1
+    assert len(client.get("/records").json()) == 1
+
+
+def test_similar_but_conflicting_identity_requires_review(client):
+    client.post("/ingest/provider_alpha", json=alpha_record(
+        email="first@example.test", first_name="Jordan", last_name="Lee", company="Orbit Works"
+    ))
+    response = client.post("/ingest/provider_beta", json={
+        "contactId": "beta-conflict",
+        "contactEmail": "second@example.test",
+        "fullName": "Jordan Lee",
+        "organization": {"name": "Orbit Works"},
+    })
+    assert response.json()["review_count"] == 1
+    assert response.json()["items"][0]["reasons"] == ["identity_conflict_different_email"]
+    assert len(client.get("/records").json()) == 2
+
+
+def test_ambiguous_partial_match_is_not_merged(client):
+    client.post("/ingest/provider_alpha", json=alpha_record(
+        email="known@example.test", first_name="Avery", last_name="Stone", company="Known Co"
+    ))
+    response = client.post("/ingest/provider_gamma", json={
+        "ref": "gamma-ambiguous",
+        "mail": "new@example.test",
+        "name": "Avery Stone",
+        "org": "Different Co",
+    })
+    assert response.json()["review_count"] == 1
+    assert response.json()["items"][0]["reasons"] == ["ambiguous_identity_match"]
+
+
+def test_idempotency_key_replays_original_import(client):
+    payload = alpha_record(record_id="alpha-idempotent")
+    first = client.post("/ingest/provider_alpha", json=payload, headers={"Idempotency-Key": "request-1"})
+    second = client.post("/ingest/provider_alpha", json=payload, headers={"Idempotency-Key": "request-1"})
+    assert first.status_code == 201
+    assert second.status_code == 200
+    assert second.json()["idempotent_replay"] is True
+    assert second.json()["import_id"] == first.json()["import_id"]
+    assert len(client.get("/records").json()) == 1
+
+
+def test_batch_contains_accepted_review_and_rejected_items(client):
+    response = client.post("/ingest/provider_gamma", json={"records": [
+        {"ref": "g-accepted", "mail": "ok@example.test", "name": "Ok Person", "org": "Example Co"},
+        {"ref": "g-review", "mail": "", "name": "Review Person", "org": "Example Co"},
+        {"ref": "g-rejected", "mail": "broken", "name": "Bad Person", "org": "Example Co"},
+    ]})
+    body = response.json()
+    assert body["accepted_count"] == 1
+    assert body["review_count"] == 1
+    assert body["rejected_count"] == 1
+    assert body["status"] == "partial"
