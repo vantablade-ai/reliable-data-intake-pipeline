@@ -151,3 +151,54 @@ def test_batch_contains_accepted_review_and_rejected_items(client):
     assert body["review_count"] == 1
     assert body["rejected_count"] == 1
     assert body["status"] == "partial"
+
+
+def test_duplicate_identity_precedes_nonfatal_mapping_issue(client):
+    client.post("/ingest/provider_alpha", json=alpha_record())
+    response = client.post("/ingest/provider_alpha", json=alpha_record(record_id="alpha-2", first_name=12))
+    item = response.json()["items"][0]
+    assert item["decision"] == "DUPLICATE"
+    assert item["record_id"]
+    assert len(client.get("/records").json()) == 1
+
+
+def test_processing_failure_rolls_back_items_and_records_and_keeps_failed_job(app, client, monkeypatch):
+    repository = app.state.service.repository
+    original = repository.insert_item
+    calls = 0
+
+    def failing_insert(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise __import__("app.repositories.records", fromlist=["PersistenceError"]).PersistenceError("test fault")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "insert_item", failing_insert)
+    response = client.post("/ingest/provider_alpha", json={"records": [alpha_record(record_id="tx-1"), alpha_record(record_id="tx-2", email="second@example.test")]})
+    assert response.status_code == 503
+    jobs = list(app.state.connection.execute("SELECT id, status FROM import_jobs"))
+    assert len(jobs) == 1 and jobs[0]["status"] == "failed"
+    assert app.state.connection.execute("SELECT COUNT(*) FROM canonical_records").fetchone()[0] == 0
+    assert app.state.connection.execute("SELECT COUNT(*) FROM import_items").fetchone()[0] == 0
+    assert client.get(f"/imports/{jobs[0]['id']}").json()["status"] == "failed"
+    monkeypatch.setattr(repository, "insert_item", original)
+
+
+def test_unique_conflict_raises_persistence_error_not_empty_id(client, app):
+    from app.repositories.records import PersistenceError
+
+    service = app.state.service
+    payload = alpha_record(record_id="unique-1")
+    first = client.post("/ingest/provider_alpha", json=payload)
+    existing_id = first.json()["items"][0]["record_id"]
+    candidate = normalize_candidate(ProviderCandidate(source_record_id="unique-2", email=payload["email"], first_name=payload["first_name"], last_name=payload["last_name"], company_name=payload["company"]))
+    # A direct conflicting insert must be explicit; normal service flow resolves it as DUPLICATE.
+    from app.models import RecordStatus
+    try:
+        service._persist_record("provider_alpha", candidate, RecordStatus.ACCEPTED, [], candidate.identity_fingerprint)
+    except PersistenceError:
+        pass
+    else:
+        raise AssertionError("unique fingerprint collision was not surfaced")
+    assert existing_id

@@ -1,64 +1,45 @@
-# Architecture
+# Architecture notes
 
-## Request lifecycle
+## API boundary
 
-1. `POST /ingest/{provider}` receives one JSON object, a list, or an object with a `records` list.
-2. The provider registry selects one adapter. Unsupported providers fail before persistence.
-3. The adapter maps provider-specific fields into `ProviderCandidate` values. It does not write to the database.
-4. Normalization trims text, lowercases email addresses, validates deterministic formats, and records reasons for unsafe input.
-5. The intake service checks the source record key, normalized email, and conservative name/company evidence.
-6. The repository persists accepted or review-required canonical records and an import-item audit row.
-7. The import job is finalized with counts and an explicit status.
+`POST /ingest/{provider}` accepts a JSON object, a list, or an object whose `records` member is a list. Provider selection and envelope validation happen before creating an import job. Batches are limited to 100 candidates by default; `MAX_BATCH_SIZE` configures the bound. Malformed JSON and invalid envelopes return 422; oversized batches return 413. The API translates expected domain and persistence failures into controlled responses.
 
-## Adapter boundary
+## Adapter and canonical boundaries
 
-Adapters only understand their provider's JSON shape:
+The adapter registry selects Alpha, Beta, or Gamma. Adapters own provider field names, nested organization/name handling, and parse-time field type reasons. They return `ProviderCandidate`; downstream code does not branch on provider-specific fields. Normalization trims and collapses whitespace, case-folds email for comparison/storage, and validates source ID, email syntax, and minimum name identity. Raw payloads are never stored.
 
-- Alpha uses `record_id`, `email`, separate name fields, and `company`.
-- Beta uses `contactId`, `contactEmail`, `fullName`, and nested `organization`.
-- Gamma uses `ref`, `mail`, `name`, and `org`.
+## Decisions and uncertainty
 
-The service never branches on those provider-specific field names. This keeps schema drift local to an adapter and makes another provider a contained addition.
+Hard invalidity is rejected first. The service next checks source replay, then targeted identity evidence, then non-fatal mapping reasons and missing email. Valid known duplicates therefore win over soft mapping issues. Outcomes are explicit: `ACCEPTED`, `REVIEW_REQUIRED`, `REJECTED`, or `DUPLICATE`.
 
-## Canonical model
+Source replay is a lookup by `(source, source_record_id)`. Entity matching uses indexed queries for normalized email, exact first/last/company, and candidates sharing any of at least two supplied identity components. Exact name/company with no email on either row is a duplicate. The same full identity with conflicting non-empty emails requires review. Partial overlap with no safe equality proof also requires review. The service interprets returned candidates; no probabilistic matching is used.
 
-`canonical_records` stores the normalized application shape: source, source record ID, email, names, company, an identity fingerprint, lifecycle status, review reasons, and timestamps. Raw provider payloads are deliberately not persisted.
-
-The canonical persistence states are:
-
-- `ACCEPTED`: a valid email is sufficient stable identity for this demonstration.
-- `REVIEW_REQUIRED`: the record is processable but has missing email, identity conflict, ambiguity, or a non-fatal mapping issue.
-- `REJECTED`: the record is not persisted as a canonical record because its source ID, email, or minimum identity evidence is invalid.
-
-Rejected decisions remain visible in the import summary and item audit table without storing the raw payload.
-
-## Dedupe and identity strategy
-
-There are two distinct guarantees:
-
-1. Source replay: `UNIQUE(source, source_record_id)` prevents the same provider record from creating another canonical record.
-2. Entity dedupe: normalized email is the strongest cross-provider identity signal. Exact name + company identity can deduplicate records that both lack email. A same-name/company conflict with different emails is review-only, and partial matches are never merged.
-
-The identity fingerprint is SHA-256 over normalized identity values. It is a lookup/deduplication key, not a security credential. Fingerprints are only stored when the identity is sufficiently complete; uncertain review records do not receive a guessed identity key.
+The SHA-256 identity fingerprint is based on normalized email or complete normalized first/last/company identity. It is a deterministic uniqueness aid, not a security token. Uncertain conflict/ambiguity reviews omit it so persistence cannot imply a merge.
 
 ## Idempotency
 
-An optional `Idempotency-Key` is unique on `import_jobs`. Replaying the same key returns the original import ID and summary with `idempotent_replay=true`. Without that header, a repeated request may create a new import job, but source and identity uniqueness still prevents duplicate canonical state.
+The service hashes canonical JSON containing provider and payload, serialized with sorted object keys and compact separators. This makes JSON object key order irrelevant. The import job stores the digest and optional unique `Idempotency-Key`, not the request body. Same key and digest returns the original persisted summary; a changed provider or digest raises an idempotency conflict and creates no new job. The HTTP response is 409.
 
-This project treats source records as immutable intake events: a replay does not silently update the existing canonical record. A future system could add an explicit reconciliation/update workflow if source corrections need to be applied.
+## Persistence and transaction boundary
 
-## Persistence
+SQLite is the only executed persistence backend. `IntakeRepository.transaction()` wraps canonical record writes, import-item audit writes, and final import counts/status. Repository write methods inside it do not commit independently. A newly created job is committed before processing so it remains observable. Processing failure rolls back the processing transaction; `fail_import_job` then records `failed` and a safe error in a separate transaction. The API maps persistence failures to 503 without exposing SQLite details.
 
-SQLite is used for zero-friction local execution. `schema.sql` keeps the model relational and includes checks, foreign keys, unique constraints, and indexes. The repository is the only layer that issues SQL, so a PostgreSQL implementation can replace it without changing adapters or normalization rules.
+The schema uses relational constraints and indexes, including unique source identity and fingerprint, plus targeted identity lookup indexes. PostgreSQL itself is not executed by this repository; portability is limited to conventional relational design choices rather than a tested backend claim.
 
 ## Failure behavior
 
-- Invalid JSON is rejected by FastAPI with a 422 response.
-- Unsupported providers return a controlled 422 response.
-- Invalid records become rejected item decisions with safe reasons.
-- Database failures are translated into a 503 `persistence_error` response.
-- Unexpected processing failures are logged server-side, mark the import failed, and do not expose a traceback to the caller.
+- Malformed JSON, unsupported providers, and invalid envelopes: 422.
+- Oversized batches: 413 before import/canonical writes.
+- Missing resources: 404.
+- Idempotency mismatch: 409.
+- Record-level hard invalidity: persisted as a rejected import item without a canonical record.
+- Persistence failure: processing rollback, observable failed job, safe 503 response.
+- Unexpected processing exceptions are logged server-side, rolled back, and exposed as a generic persistence failure boundary.
 
-## Testing strategy
+## Test strategy
 
-Tests exercise both the service and HTTP boundary. They cover each adapter, normalization, exact replay, cross-provider duplicate handling, ambiguous identity routing, explicit outcome states, API validation, and repository-backed canonical persistence. All test data is synthetic.
+Tests use temporary SQLite databases and in-process `httpx.ASGITransport`; no server, credentials, network, or external account is needed. They cover each adapter and outcome, normalization, source replay, cross-provider deduplication, conflicting/ambiguous identity, request hashing/replay/conflict, batch boundaries, resource errors, and rollback with a preserved failed job. The one-process-per-request harness was removed because it provided no required isolation; per-test temporary databases provide isolation directly.
+
+## Known limitations
+
+Provider schemas are synthetic and fixed. Matching is conservative and deterministic, not fuzzy. There is no update/reconciliation workflow for changed source data, authentication, authorization, rate limiting, async queue, migration framework, production observability, or PostgreSQL runtime. The default local SQLite database is for demonstration use.

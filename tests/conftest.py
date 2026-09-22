@@ -1,46 +1,41 @@
 from __future__ import annotations
 
-import json
+import asyncio
 from pathlib import Path
-import subprocess
-import sys
 from typing import Any
 
+import httpx
 import pytest
+
+from app.main import create_app
 
 
 class LocalClient:
-    """Synchronous test client that exercises the ASGI app in a child process."""
+    """Synchronous wrapper around an in-process ASGI transport."""
 
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
+    def __init__(self, app):
+        self.transport = httpx.ASGITransport(app=app)
 
-    def request(self, method: str, url: str, **kwargs: Any) -> "LocalResponse":
-        request = {"method": method, "url": url, "kwargs": kwargs}
-        helper = Path(__file__).with_name("asgi_request.py")
-        completed = subprocess.run(
-            [sys.executable, str(helper), str(self.db_path)],
-            input=json.dumps(request), text=True, capture_output=True, check=True, timeout=10,
-            cwd=Path(__file__).parents[1],
-        )
-        return LocalResponse(json.loads(completed.stdout))
+    def request(self, method: str, url: str, **kwargs: Any):
+        async def send():
+            async with httpx.AsyncClient(transport=self.transport, base_url="http://testserver") as client:
+                return await client.request(method, url, **kwargs)
+        return asyncio.run(send())
 
-    def get(self, url: str, **kwargs: Any) -> "LocalResponse":
+    def get(self, url: str, **kwargs: Any):
         return self.request("GET", url, **kwargs)
 
-    def post(self, url: str, **kwargs: Any) -> "LocalResponse":
+    def post(self, url: str, **kwargs: Any):
         return self.request("POST", url, **kwargs)
 
 
-class LocalResponse:
-    def __init__(self, payload: dict[str, Any]):
-        self.status_code = payload["status_code"]
-        self.text = payload["text"]
-
-    def json(self) -> Any:
-        return json.loads(self.text)
+@pytest.fixture()
+def app(tmp_path: Path):
+    application = create_app(tmp_path / "test.db")
+    yield application
+    application.state.connection.close()
 
 
 @pytest.fixture()
-def client(tmp_path: Path) -> LocalClient:
-    return LocalClient(tmp_path / "test.db")
+def client(app):
+    return LocalClient(app)

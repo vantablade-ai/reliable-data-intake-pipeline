@@ -15,4 +15,7 @@ def connect_database(path: Path) -> sqlite3.Connection:
 def initialize_database(connection: sqlite3.Connection) -> None:
     schema_path = Path(__file__).resolve().parent.parent / "schema.sql"
     connection.executescript(schema_path.read_text(encoding="utf-8"))
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(import_jobs)")}
+    if "request_fingerprint" not in columns:
+        connection.execute("ALTER TABLE import_jobs ADD COLUMN request_fingerprint TEXT")
     connection.commit()
